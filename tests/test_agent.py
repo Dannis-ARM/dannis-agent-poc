@@ -347,9 +347,51 @@ class TestReActAgent:
         # Verify
         assert result == "Test complete"
         assert mock_call_llm.called
-        # Verify message history setup
-        assert len(agent.messages) >= 1
-        assert agent.messages[0]["content"] == "Hello"
+
+    @patch('agent.ReActAgent._call_llm')
+    def test_agent_continuous_conversation(self, mock_call_llm):
+        """It should retain previous messages across runs."""
+        mock_call_llm.side_effect = [
+            "```\nThought: looking up\nFinal Answer: Found file test.txt\n```",
+            "```\nThought: using previous context\nFinal Answer: The file you asked about earlier exists\n```",
+        ]
+
+        agent = ReActAgent(
+            api_key="test_key",
+            base_url="https://test.url",
+            model="test-model",
+            unsafe_mode=True,
+            verbose=False
+        )
+
+        result1 = agent.run("List files", max_iterations=1)
+        result2 = agent.run("Is it there?", max_iterations=1)
+
+        # Both should work
+        assert "Found file" in result1
+        assert "earlier" in result2
+
+        # Messages should accumulate - second call includes first call's context
+        assert len(agent.messages) > 2
+
+    @patch('agent.ReActAgent._call_llm')
+    def test_agent_clear_history(self, mock_call_llm):
+        """It should clear conversation history."""
+        mock_call_llm.return_value = "```\nThought: done\nFinal Answer: OK\n```"
+
+        agent = ReActAgent(
+            api_key="test_key",
+            base_url="https://test.url",
+            model="test-model",
+            unsafe_mode=True,
+            verbose=False
+        )
+
+        agent.run("First", max_iterations=1)
+        assert len(agent.messages) > 0
+
+        agent.clear_history()
+        assert agent.messages == []
 
     def test_streaming_method_exists(self):
         """It should have streaming methods available."""

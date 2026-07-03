@@ -229,6 +229,73 @@ TOOL_REGISTRY: Dict[str, Callable] = {
 }
 
 
+class SessionManager:
+    """Manages session persistence and retrieval."""
+
+    SESSIONS_DIR = PROJECT_ROOT / "memory"
+
+    def __init__(self, memory_dir: Optional[Path] = None):
+        self.memory_dir = memory_dir or self.SESSIONS_DIR
+        self.memory_dir.mkdir(exist_ok=True)
+
+    def generate_session_id(self) -> str:
+        """Generate a unique session ID based on current timestamp."""
+        return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    def create_new_session(self) -> str:
+        """Create a new empty session file and return its ID."""
+        session_id = self.generate_session_id()
+        session_file = self.memory_dir / f"session-{session_id}.jsonl"
+        session_file.touch()
+        return session_id
+
+    def append_message(self, session_id: str, role: str, content: str, timestamp: str) -> None:
+        """Append a message to the session file."""
+        session_file = self.memory_dir / f"session-{session_id}.jsonl"
+        msg = {"role": role, "content": content, "timestamp": timestamp}
+        with session_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
+    def load_session(self, session_id: str) -> List[Dict[str, str]]:
+        """Load all messages from a session file."""
+        session_file = self.memory_dir / f"session-{session_id}.jsonl"
+        if not session_file.exists():
+            return []
+        messages = []
+        for line in session_file.read_text(encoding="utf-8").strip().split("\n"):
+            if line.strip():
+                messages.append(json.loads(line))
+        return messages
+
+    def list_sessions(self) -> List[str]:
+        """List session IDs, newest first."""
+        session_files = sorted(
+            self.memory_dir.glob("session-*.jsonl"),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        sessions = []
+        for sf in session_files:
+            sid = sf.stem.replace("session-", "")
+            sessions.append(sid)
+        return sessions
+
+    def get_latest_session(self) -> Optional[str]:
+        """Return the newest session ID, or None if none exist."""
+        sessions = self.list_sessions()
+        return sessions[0] if sessions else None
+
+    def session_exists(self, session_id: str) -> bool:
+        """Check whether a session file exists."""
+        session_file = self.memory_dir / f"session-{session_id}.jsonl"
+        return session_file.exists()
+
+    def to_agent_messages(self, session_id: str) -> List[Dict[str, str]]:
+        """Convert session messages to agent format (without timestamps)."""
+        messages = self.load_session(session_id)
+        return [{"role": m["role"], "content": m["content"]} for m in messages]
+
+
 def parse_action(response: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Parse Thought, Action (tool_name|params), or Final Answer from response."""
     # First, extract code block if present
@@ -417,9 +484,13 @@ class ReActAgent:
         else:
             return self._call_llm_non_streaming()
 
+    def clear_history(self) -> None:
+        """Reset conversation history."""
+        self.messages = []
+
     def run(self, user_query: str, max_iterations: int = 10) -> str:
-        """Run the agent on a user query."""
-        self.messages = [{"role": "user", "content": user_query}]
+        """Run the agent on a user query, retaining conversation context."""
+        self.messages.append({"role": "user", "content": user_query})
 
         if self.verbose:
             print(f"\n{Fore.CYAN}--- ReAct Agent Started ---{Style.RESET_ALL}")
@@ -498,6 +569,10 @@ def main():
     parser.add_argument("--max-iter", type=int, default=10, help="Max iterations (default: 10)")
     parser.add_argument("--no-log", action="store_true", help="Don't save conversation log")
     parser.add_argument("--no-streaming", action="store_true", help="Disable streaming output")
+    parser.add_argument("--list-sessions", action="store_true", help="List recent sessions")
+    parser.add_argument("--resume", type=str, metavar="SESSION_ID", help="Resume a specific session")
+    parser.add_argument("--resume-last", action="store_true", help="Resume the most recent session")
+    parser.add_argument("--new-session", action="store_true", help="Start a new session (default)")
 
     args = parser.parse_args()
 
@@ -511,6 +586,35 @@ def main():
     base_url = os.getenv("DOUBAO_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding")
     model = os.getenv("DOUBAO_MODEL", "doubao-seed-2-0-code-preview-latest")
 
+    session_mgr = SessionManager()
+
+    # Handle --list-sessions
+    if args.list_sessions:
+        sessions = session_mgr.list_sessions()
+        if sessions:
+            print(f"\n{Fore.CYAN}Recent sessions:{Style.RESET_ALL}")
+            for i, sid in enumerate(sessions, 1):
+                sf = session_mgr.memory_dir / f"session-{sid}.jsonl"
+                size = sf.stat().st_size
+                print(f"  {i}. {sid}  ({size} bytes)")
+        else:
+            print(f"{Fore.YELLOW}No sessions found.{Style.RESET_ALL}")
+        return
+
+    # Resolve session ID
+    if args.resume:
+        session_id = args.resume
+        if not session_mgr.session_exists(session_id):
+            print(f"{Fore.RED}Error: Session {session_id} not found.{Style.RESET_ALL}")
+            sys.exit(1)
+    elif args.resume_last:
+        session_id = session_mgr.get_latest_session()
+        if not session_id:
+            print(f"{Fore.YELLOW}No previous sessions to resume. Starting new session.{Style.RESET_ALL}")
+            session_id = session_mgr.create_new_session()
+    else:
+        session_id = session_mgr.create_new_session()
+
     agent = ReActAgent(
         api_key=api_key,
         base_url=base_url,
@@ -520,20 +624,31 @@ def main():
         streaming=not args.no_streaming
     )
 
+    # Load existing session messages into agent
+    existing_messages = session_mgr.to_agent_messages(session_id)
+    if existing_messages:
+        agent.messages = existing_messages
+        if not args.quiet:
+            print(f"{Fore.CYAN}Resumed session: {session_id} ({len(existing_messages)} messages){Style.RESET_ALL}")
+
     if args.query:
         query = " ".join(args.query)
         result = agent.run(query, max_iterations=args.max_iter)
+        # Save to session
+        timestamp = datetime.now().isoformat()
+        session_mgr.append_message(session_id, "user", query, timestamp)
+        session_mgr.append_message(session_id, "assistant", result, timestamp)
         if not args.no_log:
             save_log(agent.messages)
         print()
     else:
+        if not args.resume and not args.resume_last:
+            print(f"{Fore.CYAN}Session: {session_id}{Style.RESET_ALL}")
         print(f"{Fore.CYAN}╔════════════════════════════════════════╗{Style.RESET_ALL}")
         print(f"{Fore.CYAN}║     ReAct Agent Interactive Mode       ║{Style.RESET_ALL}")
         print(f"{Fore.CYAN}║  Type 'exit' or 'quit' to exit         ║{Style.RESET_ALL}")
         print(f"{Fore.CYAN}╚════════════════════════════════════════╝{Style.RESET_ALL}")
         print()
-
-        conversation = []
 
         while True:
             try:
@@ -543,8 +658,11 @@ def main():
                 if query.lower() in ["exit", "quit", "q"]:
                     break
 
+                timestamp = datetime.now().isoformat()
                 result = agent.run(query, max_iterations=args.max_iter)
-                conversation.extend(agent.messages)
+                # Save to session
+                session_mgr.append_message(session_id, "user", query, timestamp)
+                session_mgr.append_message(session_id, "assistant", result, timestamp)
                 print()
             except KeyboardInterrupt:
                 print("\n^C")
@@ -553,8 +671,8 @@ def main():
                 print()
                 break
 
-        if not args.no_log and conversation:
-            save_log(conversation)
+        if not args.no_log:
+            save_log(agent.messages)
 
 
 if __name__ == "__main__":
