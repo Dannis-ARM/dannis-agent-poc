@@ -293,16 +293,94 @@ def parse_action(response: str) -> Tuple[Optional[str], Optional[str], Optional[
 class ReActAgent:
     """Simple ReAct Agent implementation."""
 
-    def __init__(self, api_key: str, base_url: str, model: str, unsafe_mode: bool = False, verbose: bool = True):
+    def __init__(self, api_key: str, base_url: str, model: str, unsafe_mode: bool = False, verbose: bool = True, streaming: bool = True):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.unsafe_mode = unsafe_mode
         self.verbose = verbose
+        self.streaming = streaming
         self.messages: List[Dict[str, str]] = []
 
-    def _call_llm(self) -> str:
-        """Call the LLM with Anthropic format."""
+    def _call_llm_streaming(self) -> str:
+        """Call the LLM with streaming support."""
+        headers = {
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+
+        system_msg = SYSTEM_PROMPT.format(project_root=PROJECT_ROOT)
+
+        payload = {
+            "model": self.model,
+            "system": system_msg,
+            "messages": self.messages,
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "stream": True,
+        }
+
+        full_response = []
+
+        with httpx.Client(timeout=120.0) as client:
+            with client.stream(
+                "POST",
+                f"{self.base_url}/v1/messages",
+                headers=headers,
+                json=payload
+            ) as response:
+                response.raise_for_status()
+
+                # Try to handle SSE streaming format first
+                for line in response.iter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            # Handle different streaming response formats
+                            if "delta" in data:
+                                delta = data["delta"]
+                                if "text" in delta:
+                                    text = delta["text"]
+                                    full_response.append(text)
+                                    if self.verbose:
+                                        print(f"{Fore.CYAN}{text}{Style.RESET_ALL}", end="", flush=True)
+                            elif "content" in data and len(data["content"]) > 0:
+                                text = data["content"][0].get("text", "")
+                                if text:
+                                    full_response.append(text)
+                                    if self.verbose:
+                                        print(f"{Fore.CYAN}{text}{Style.RESET_ALL}", end="", flush=True)
+                        except json.JSONDecodeError:
+                            continue
+                    elif line.strip() and not line.startswith(":"):
+                        # Fallback: if line doesn't look like SSE, try direct JSON
+                        try:
+                            data = json.loads(line)
+                            if "content" in data and len(data["content"]) > 0:
+                                text = data["content"][0].get("text", "")
+                                if text:
+                                    full_response.append(text)
+                                    if self.verbose:
+                                        print(f"{Fore.CYAN}{text}{Style.RESET_ALL}", end="", flush=True)
+                        except json.JSONDecodeError:
+                            continue
+
+        # If streaming didn't get anything (maybe API doesn't support stream=True),
+        # fall back to non-streaming
+        if not full_response:
+            return self._call_llm_non_streaming()
+
+        if self.verbose:
+            print()  # New line after streaming completes
+
+        return "".join(full_response)
+
+    def _call_llm_non_streaming(self) -> str:
+        """Call the LLM without streaming (fallback)."""
         headers = {
             "x-api-key": self.api_key,
             "Content-Type": "application/json",
@@ -327,7 +405,17 @@ class ReActAgent:
             )
             response.raise_for_status()
             result = response.json()
-            return result["content"][0]["text"]
+            text = result["content"][0]["text"]
+            if self.verbose:
+                print(f"{Fore.CYAN}{text}{Style.RESET_ALL}")
+            return text
+
+    def _call_llm(self) -> str:
+        """Call the LLM with streaming option."""
+        if self.streaming:
+            return self._call_llm_streaming()
+        else:
+            return self._call_llm_non_streaming()
 
     def run(self, user_query: str, max_iterations: int = 10) -> str:
         """Run the agent on a user query."""
@@ -339,7 +427,7 @@ class ReActAgent:
 
         for i in range(max_iterations):
             if self.verbose:
-                print(f"{Fore.MAGENTA}Step {i + 1}/{max_iterations}{Style.RESET_ALL}")
+                print(f"\n{Fore.MAGENTA}Step {i + 1}/{max_iterations}{Style.RESET_ALL}")
 
             try:
                 assistant_msg = self._call_llm()
@@ -348,7 +436,7 @@ class ReActAgent:
 
             thought, action, params_str = parse_action(assistant_msg)
 
-            if self.verbose:
+            if self.verbose and not self.streaming:
                 if thought:
                     print(f"{Fore.BLUE}Thought: {Style.RESET_ALL}{thought}")
                 if action and action != "__FINAL__":
@@ -409,6 +497,7 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Disable verbose output")
     parser.add_argument("--max-iter", type=int, default=10, help="Max iterations (default: 10)")
     parser.add_argument("--no-log", action="store_true", help="Don't save conversation log")
+    parser.add_argument("--no-streaming", action="store_true", help="Disable streaming output")
 
     args = parser.parse_args()
 
@@ -427,7 +516,8 @@ def main():
         base_url=base_url,
         model=model,
         unsafe_mode=args.unsafe,
-        verbose=not args.quiet
+        verbose=not args.quiet,
+        streaming=not args.no_streaming
     )
 
     if args.query:

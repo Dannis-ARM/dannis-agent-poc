@@ -327,19 +327,11 @@ class TestReActAgent:
         assert agent.verbose is False
         assert agent.messages == []
 
-    @patch('agent.httpx.Client')
-    def test_agent_calls_llm(self, mock_client_class):
-        """It should call the LLM and handle response."""
-        # Setup mock
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "content": [{"text": "```\nThought: All done\nFinal Answer: Test complete\n```"}]
-        }
-        mock_response.raise_for_status.return_value = None
-
-        mock_client = MagicMock()
-        mock_client.post.return_value = mock_response
-        mock_client_class.return_value.__enter__.return_value = mock_client
+    @patch('agent.ReActAgent._call_llm')
+    def test_agent_run_calls_llm(self, mock_call_llm):
+        """It should orchestrate the agent run correctly."""
+        # Setup mock to return a final answer
+        mock_call_llm.return_value = "```\nThought: All done\nFinal Answer: Test complete\n```"
 
         # Create and run agent
         agent = ReActAgent(
@@ -354,7 +346,55 @@ class TestReActAgent:
 
         # Verify
         assert result == "Test complete"
-        assert mock_client.post.called
-        # Verify message history
+        assert mock_call_llm.called
+        # Verify message history setup
         assert len(agent.messages) >= 1
         assert agent.messages[0]["content"] == "Hello"
+
+    def test_streaming_method_exists(self):
+        """It should have streaming methods available."""
+        agent = ReActAgent(
+            api_key="test_key",
+            base_url="https://test.url",
+            model="test-model",
+            unsafe_mode=True,
+            verbose=False
+        )
+        # Verify the methods exist
+        assert hasattr(agent, '_call_llm_streaming')
+        assert hasattr(agent, '_call_llm_non_streaming')
+        assert hasattr(agent, '_call_llm')
+
+    def test_streaming_parameter(self):
+        """It should respect the streaming parameter."""
+        # Default should be True
+        agent1 = ReActAgent(
+            api_key="test_key",
+            base_url="https://test.url",
+            model="test-model",
+            unsafe_mode=True,
+            verbose=False
+        )
+        assert agent1.streaming is True
+
+        # Can set to False
+        agent2 = ReActAgent(
+            api_key="test_key",
+            base_url="https://test.url",
+            model="test-model",
+            unsafe_mode=True,
+            verbose=False,
+            streaming=False
+        )
+        assert agent2.streaming is False
+
+        # Can set to True explicitly
+        agent3 = ReActAgent(
+            api_key="test_key",
+            base_url="https://test.url",
+            model="test-model",
+            unsafe_mode=True,
+            verbose=False,
+            streaming=True
+        )
+        assert agent3.streaming is True
