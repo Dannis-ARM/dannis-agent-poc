@@ -1,0 +1,15 @@
+[project]
+name = "dannis-agent-poc"
+version = "0.1.0"
+description = "ReAct Agent demo for learning AI agent concepts"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "colorama>=0.4.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
